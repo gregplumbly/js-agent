@@ -1,0 +1,13 @@
+{
+  "name": "js-agent",
+  "version": "1.0.0",
+  "description": "A JavaScript agent that chats with Claude",
+  "main": "agent.js",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env agent.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.27.3"
+  }
+}
