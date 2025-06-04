@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import * as readline from 'readline';
-import { readFileSync, readdirSync } from 'fs';
+import { toolDefinitions, executeTool } from './tools.js';
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -14,63 +14,107 @@ const rl = readline.createInterface({
 class SimpleAgent {
   constructor() {
     this.conversation = [];
-    this.tools = [
-      {
-        name: 'read_file',
-        description: 'Read the contents of a file',
-        input_schema: {
-          type: 'object',
-          properties: {
-            path: {
-              type: 'string',
-              description: 'The path to the file to read'
-            }
-          },
-          required: ['path']
-        }
-      },
-      {
-        name: 'list_files',
-        description: 'List files and directories in a given path',
-        input_schema: {
-          type: 'object',
-          properties: {
-            path: {
-              type: 'string',
-              description: 'The directory path to list (defaults to current directory)'
-            }
-          }
+    this.tools = toolDefinitions;
+  }
+
+  async processResponse(response) {
+    let assistantMessage = '';
+    const toolResults = [];
+    const toolOutputs = [];
+
+    for (const contentBlock of response.content) {
+      if (contentBlock.type === 'text') {
+        assistantMessage += contentBlock.text;
+      } else if (contentBlock.type === 'tool_use') {
+        const toolResult = executeTool(contentBlock.name, contentBlock.input);
+        toolResults.push({
+          tool_use_id: contentBlock.id,
+          content: toolResult
+        });
+        toolOutputs.push(toolResult);
+      }
+    }
+
+    // Display assistant message first
+    if (assistantMessage) {
+      console.log(`Agent: ${assistantMessage}\n`);
+    }
+
+    // Then display tool outputs
+    toolOutputs.forEach(output => {
+      console.log(`${output}\n`);
+    });
+
+    return { assistantMessage, toolResults };
+  }
+
+  async handleToolResults(toolResults) {
+    if (toolResults.length === 0) return;
+
+    // Add tool results to conversation
+    this.conversation.push({
+      role: 'user',
+      content: toolResults.map(result => ({
+        type: 'tool_result',
+        tool_use_id: result.tool_use_id,
+        content: result.content
+      }))
+    });
+
+    // Get Claude's follow-up response
+    const followUpResponse = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      messages: this.conversation,
+      tools: this.tools
+    });
+
+    const { toolResults: followUpToolResults } = await this.processResponse(followUpResponse);
+
+    // Add follow-up response to conversation
+    if (followUpResponse.content && followUpResponse.content.length > 0) {
+      this.conversation.push({
+        role: 'assistant',
+        content: followUpResponse.content
+      });
+    }
+
+    // Handle any additional tool calls recursively
+    if (followUpToolResults.length > 0) {
+      this.conversation.push({
+        role: 'user',
+        content: followUpToolResults.map(result => ({
+          type: 'tool_result',
+          tool_use_id: result.tool_use_id,
+          content: result.content
+        }))
+      });
+
+      // Get a final summary response
+      const finalResponse = await anthropic.messages.create({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1024,
+        messages: this.conversation
+      });
+
+      let finalMessage = '';
+      for (const contentBlock of finalResponse.content) {
+        if (contentBlock.type === 'text') {
+          finalMessage += contentBlock.text;
         }
       }
-    ];
-  }
 
-  executeReadFile(path) {
-    try {
-      const content = readFileSync(path, 'utf8');
-      return content;
-    } catch (error) {
-      return `Error reading file: ${error.message}`;
-    }
-  }
+      if (finalMessage) {
+        console.log(`Agent: ${finalMessage}\n`);
+      }
 
-  executeListFiles(path = '.') {
-    try {
-      const files = readdirSync(path);
-      return files.join('\n');
-    } catch (error) {
-      return `Error listing directory: ${error.message}`;
-    }
-  }
-
-  executeTool(toolName, input) {
-    switch (toolName) {
-      case 'read_file':
-        return this.executeReadFile(input.path);
-      case 'list_files':
-        return this.executeListFiles(input.path);
-      default:
-        return `Unknown tool: ${toolName}`;
+      // Add final response to conversation
+      if (finalResponse.content && finalResponse.content.length > 0) {
+        this.conversation.push({
+          role: 'assistant',
+          content: finalResponse.content
+        });
+      }
     }
   }
 
@@ -98,70 +142,18 @@ class SimpleAgent {
           tools: this.tools
         });
 
-        let assistantMessage = '';
-        const toolResults = [];
-        const toolOutputs = [];
+        const { toolResults } = await this.processResponse(response);
 
-        for (const contentBlock of response.content) {
-          if (contentBlock.type === 'text') {
-            assistantMessage += contentBlock.text;
-          } else if (contentBlock.type === 'tool_use') {
-            const toolResult = this.executeTool(contentBlock.name, contentBlock.input);
-            toolResults.push({
-              tool_use_id: contentBlock.id,
-              content: toolResult
-            });
-            toolOutputs.push(toolResult);
-          }
-        }
-
-        if (assistantMessage) {
-          console.log(`Agent: ${assistantMessage}\n`);
-        }
-
-        toolOutputs.forEach(output => {
-          console.log(`${output}\n`);
-        });
-
-        this.conversation.push({
-          role: 'assistant',
-          content: response.content
-        });
-
-        if (toolResults.length > 0) {
-          this.conversation.push({
-            role: 'user',
-            content: toolResults.map(result => ({
-              type: 'tool_result',
-              tool_use_id: result.tool_use_id,
-              content: result.content
-            }))
-          });
-
-          // Get Claude's response to the tool results
-          const followUpResponse = await anthropic.messages.create({
-            model: 'claude-3-5-sonnet-20241022',
-            max_tokens: 1024,
-            messages: this.conversation,
-            tools: this.tools
-          });
-
-          let followUpMessage = '';
-          for (const contentBlock of followUpResponse.content) {
-            if (contentBlock.type === 'text') {
-              followUpMessage += contentBlock.text;
-            }
-          }
-
-          if (followUpMessage) {
-            console.log(`Agent: ${followUpMessage}\n`);
-          }
-
+        // Add initial response to conversation
+        if (response.content && response.content.length > 0) {
           this.conversation.push({
             role: 'assistant',
-            content: followUpResponse.content
+            content: response.content
           });
         }
+
+        // Handle any tool results
+        await this.handleToolResults(toolResults);
 
       } catch (error) {
         console.error('Error:', error.message);
